@@ -19,30 +19,24 @@
       </div>
       <div class="hero-right">
         <span class="root-badge" id="rootBadge">…</span>
-        <span class="ver">v1.4.1</span>
+        <span class="ver">v1.5.0</span>
       </div>
     </header>
 
-    <!-- STEP 1: pick / add game -->
     <section class="card">
-      <h2>Pick game</h2>
-      <p class="hint">Scan installed apps or type a package name.</p>
+      <h2>Installed apps</h2>
+      <p class="hint">Tap an app to configure GPU / hide for it.</p>
 
       <div class="actions" style="margin:0 0 12px; grid-template-columns:1fr 1fr">
-        <button class="btn" id="scanBtn">Scan installed</button>
-        <button class="btn" id="refreshBtn">Refresh list</button>
+        <button class="btn primary" id="scanBtn">Scan apps</button>
+        <button class="btn" id="refreshBtn">Refresh</button>
       </div>
 
-      <label>Search / filter</label>
-      <input id="pkgFilter" type="text" placeholder="type to filter…" />
+      <label>Search</label>
+      <input id="pkgFilter" type="text" placeholder="name or package…" />
 
       <div class="pkg-picker" id="pkgPicker">
-        <p class="hint" id="pickerHint">Tap Scan, or enter a package below.</p>
-      </div>
-
-      <div class="add-row" style="margin-top:12px">
-        <input id="newPkg" type="text" placeholder="com.example.game" />
-        <button class="btn small primary" id="addGameBtn">Add</button>
+        <p class="hint" id="pickerHint">Tap Scan apps to load installed apps.</p>
       </div>
     </section>
 
