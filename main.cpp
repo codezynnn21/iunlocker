@@ -13,6 +13,7 @@
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/prctl.h>
 #include <pthread.h>
 #include "zygisk.hpp"
@@ -491,16 +492,28 @@ static void try_system_inline() {
 
 static void *watcher(void *) {
     prctl(PR_SET_NAME, "iun-hook", 0, 0, 0);
-    for (int i = 0; i < 20; i++) {
-        usleep(500000);
-        if (!g_target) break;
-        try {
-            patch_app_plts();
-            try_system_inline();
-        } catch (...) {
-            LOGE("watcher exception swallowed");
+    /* let CODM finish cold start / first frame */
+    usleep(2000000);
+    if (real_dlsym) {
+        void *g = dlopen("libGLESv2.so", RTLD_NOW);
+        if (g && !orig_glGetString)
+            orig_glGetString = (const char *(*)(unsigned))call_real_dlsym(g, "glGetString");
+        void *e = dlopen("libEGL.so", RTLD_NOW);
+        if (e && !orig_eglGetProcAddress)
+            orig_eglGetProcAddress = (void *(*)(const char *))call_real_dlsym(e, "eglGetProcAddress");
+        void *v = dlopen("libvulkan.so", RTLD_NOW);
+        if (v) {
+            if (!orig_vkGPDP) orig_vkGPDP = (PFN_vkGPDP)call_real_dlsym(v, "vkGetPhysicalDeviceProperties");
+            if (!orig_vkGIPA) orig_vkGIPA = (PFN_vkGIPA)call_real_dlsym(v, "vkGetInstanceProcAddr");
         }
+        LOGI("resolved gl=%p egl=%p vk=%p", (void*)orig_glGetString, (void*)orig_eglGetProcAddress, (void*)orig_vkGPDP);
+    }
+    for (int i = 0; i < 24; i++) {
+        if (!g_target) break;
+        patch_app_plts();
+        try_system_inline();
         if (g_gl_inline && g_vk_inline) break;
+        usleep(500000);
     }
     LOGI("watcher done gl_inline=%d vk_inline=%d",
          (int)g_gl_inline.load(), (int)g_vk_inline.load());
@@ -623,9 +636,13 @@ public:
             if (h) real_dlsym = (void *(*)(void *, const char *))dlsym(h, "dlsym");
         }
 
-        bool got = false;
+        /* config: disk first (fast), companion optional with 1s timeout */
+        load_config_disk();
         int cfd = api->connectCompanion();
         if (cfd >= 0) {
+            struct timeval tv{1, 0};
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             uint32_t n = 0;
             if (read(cfd, &n, sizeof(n)) == (ssize_t)sizeof(n) && n > 0 && n < 2*1024*1024) {
                 std::string json(n, '\0');
@@ -635,11 +652,13 @@ public:
                     if (r <= 0) break;
                     off += (size_t)r;
                 }
-                if (off == n) { parse_config_json(json); got = true; }
+                if (off == n) {
+                    parse_config_json(json);
+                    LOGI("config from companion");
+                }
             }
             close(cfd);
         }
-        if (!got) load_config_disk();
 
         auto it = g_games.find(nice);
         if (it == g_games.end() || !it->second.enabled) {
@@ -675,27 +694,12 @@ public:
             __system_property_set("ro.boot.warranty_bit", "0");
             __system_property_set("sys.oem_unlock_allowed", "0");
         }
-        /* resolve originals for fallback */
-        if (real_dlsym) {
-            void *g = dlopen("libGLESv2.so", RTLD_NOW);
-            if (g && !orig_glGetString)
-                orig_glGetString = (const char *(*)(unsigned))call_real_dlsym(g, "glGetString");
-            void *e = dlopen("libEGL.so", RTLD_NOW);
-            if (e && !orig_eglGetProcAddress)
-                orig_eglGetProcAddress = (void *(*)(const char *))call_real_dlsym(e, "eglGetProcAddress");
-            void *v = dlopen("libvulkan.so", RTLD_NOW);
-            if (v) {
-                if (!orig_vkGPDP) orig_vkGPDP = (PFN_vkGPDP)call_real_dlsym(v, "vkGetPhysicalDeviceProperties");
-                if (!orig_vkGIPA) orig_vkGIPA = (PFN_vkGIPA)call_real_dlsym(v, "vkGetInstanceProcAddr");
-            }
-        }
-        /* layer 2 + 3: app PLT then best-effort system inline */
-        patch_app_plts();
-        try_system_inline();
+        /* do NOT patch on main thread — freezes launch (stuck on icon).
+         * dlsym hook is already active from preSpecialize; heavy work after delay. */
         pthread_t th;
         pthread_create(&th, nullptr, watcher, nullptr);
         pthread_detach(th);
-        LOGI("post armed");
+        LOGI("post armed (deferred hooks)");
     }
 
 private:
