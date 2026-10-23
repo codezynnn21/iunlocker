@@ -1,12 +1,11 @@
 /*
  * iUnlocker GLTool - multi-game hide + GPU/RAM spoof
- * Works across devices: arm64/arm, Adreno/Mali/PowerVR/Immortalis, Android 8+
- * Reads /data/adb/iunlocker/config.json  (per-package map)
- * Hooks: open/openat path denial, glGetString (multiple GLES/EGL libs),
- *        /proc/self/maps line filter, /proc/meminfo MemTotal rewrite
+ * Zygisk modern API (dev/inode pltHook). Forces early GLES load so
+ * glGetString can be registered in preAppSpecialize.
  */
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+#include <sys/mman.h>
 #include "zygisk.hpp"
 #include <android/log.h>
 #include <sys/system_properties.h>
@@ -25,6 +24,7 @@
 
 #define TAG "iunlocker"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
@@ -52,13 +52,9 @@ struct GpuConfig {
 static std::unordered_map<std::string, GpuConfig> g_games;
 static GpuConfig g_cfg;
 static bool g_target = false;
+static Api *g_api = nullptr;
 
-static bool path_blocked(const char *p) {
-    if (!p || !g_cfg.paths) return false;
-    for (int i = 0; BLOCK_PATHS[i]; i++)
-        if (strstr(p, BLOCK_PATHS[i])) return true;
-    return false;
-}
+/* ---------------- JSON helpers ---------------- */
 
 static std::string extract_str(const std::string &json, const char *key) {
     auto p = json.find(key);
@@ -85,9 +81,7 @@ static int extract_int(const std::string &json, const char *key, int def) {
     if (p == std::string::npos) return def;
     auto num = json.find_first_of("0123456789", p);
     if (num == std::string::npos) return def;
-    try {
-        return std::stoi(json.substr(num));
-    } catch (...) { return def; }
+    try { return std::stoi(json.substr(num)); } catch (...) { return def; }
 }
 
 static GpuConfig parse_game_obj(const std::string &obj) {
@@ -108,34 +102,27 @@ static void load_config() {
     g_games.clear();
     std::ifstream f(CONFIG);
     if (!f) {
-        LOGI("no config yet — waiting for WebUI");
+        LOGI("no config yet");
         return;
     }
     std::string json((std::istreambuf_iterator<char>(f)), {});
-
     auto games_pos = json.find("\"games\"");
     if (games_pos == std::string::npos) {
-        // legacy single-object file: only apply if it has a renderer key;
-        // do not invent a package name
-        LOGI("legacy config ignored (no games map) — re-save from WebUI");
+        LOGI("legacy config ignored");
         return;
     }
-
     size_t i = json.find('{', games_pos);
     if (i == std::string::npos) return;
     i++;
-
     while (i < json.size()) {
         while (i < json.size() && (json[i]==' '||json[i]=='\n'||json[i]=='\r'||json[i]=='\t'||json[i]==','))
             i++;
         if (i >= json.size() || json[i] == '}') break;
         if (json[i] != '"') break;
-
         size_t name_start = i + 1;
         size_t name_end = json.find('"', name_start);
         if (name_end == std::string::npos) break;
         std::string pkg = json.substr(name_start, name_end - name_start);
-
         size_t obj_start = json.find('{', name_end);
         if (obj_start == std::string::npos) break;
         int depth = 1;
@@ -145,14 +132,20 @@ static void load_config() {
             else if (json[obj_end] == '}') depth--;
             obj_end++;
         }
-        std::string obj = json.substr(obj_start, obj_end - obj_start);
-        g_games[pkg] = parse_game_obj(obj);
-        LOGI("loaded %s ram=%d enabled=%d", pkg.c_str(), g_games[pkg].ram_gb, (int)g_games[pkg].enabled);
+        g_games[pkg] = parse_game_obj(json.substr(obj_start, obj_end - obj_start));
+        LOGI("cfg %s enabled=%d ram=%d", pkg.c_str(), (int)g_games[pkg].enabled, g_games[pkg].ram_gb);
         i = obj_end;
     }
-
-    // leave empty if nothing parsed — user must pick a game in WebUI
 }
+
+static bool path_blocked(const char *p) {
+    if (!p || !g_cfg.paths) return false;
+    for (int i = 0; BLOCK_PATHS[i]; i++)
+        if (strstr(p, BLOCK_PATHS[i])) return true;
+    return false;
+}
+
+/* ---------------- open/read hooks ---------------- */
 
 static int (*orig_openat)(int, const char *, int, ...) = nullptr;
 static int (*orig_open)(const char *, int, ...) = nullptr;
@@ -217,40 +210,46 @@ static ssize_t hook_read(int fd, void *buf, size_t count) {
     return n;
 }
 
+/* ---------------- GL spoof ---------------- */
+
 static const char *(*orig_glGetString)(unsigned) = nullptr;
 static const char *hook_glGetString(unsigned name) {
     switch (name) {
-        case 0x1F01: return g_cfg.vendor.c_str();
-        case 0x1F00: return g_cfg.renderer.c_str();
-        case 0x1F02: return g_cfg.version.c_str();
-        case 0x8B8C: return g_cfg.shading.c_str();
+        case 0x1F01: return g_cfg.vendor.c_str();   // GL_VENDOR
+        case 0x1F00: return g_cfg.renderer.c_str(); // GL_RENDERER
+        case 0x1F02: return g_cfg.version.c_str();  // GL_VERSION
+        case 0x8B8C: return g_cfg.shading.c_str();  // GL_SHADING_LANGUAGE_VERSION
+        default: break;
     }
     return orig_glGetString ? orig_glGetString(name) : "";
 }
 
+/* ---------------- maps → dev/inode ---------------- */
 
-/* Resolve mapped library to (dev, inode) for modern Zygisk pltHookRegister */
 static bool maps_dev_ino(const char *lib_suffix, dev_t *dev, ino_t *ino) {
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return false;
-    char line[512];
+    char line[768];
     bool ok = false;
     while (fgets(line, sizeof(line), f)) {
-        // ... pathname at end
+        // prefer executable mapping
+        if (!strstr(line, " r-xp ") && !strstr(line, " r--p ")) continue;
         char *path = strchr(line, '/');
         if (!path) continue;
-        // strip newline
         size_t n = strlen(path);
-        while (n && (path[n-1] == '\n' || path[n-1] == '\r')) path[--n] = 0;
-        if (!strstr(path, lib_suffix)) continue;
-        // parse dev and inode: fields are addr perms offset dev inode path
-        // example: 7a2b000000-7a2b100000 r-xp 00000000 08:06 1234567 /system/lib64/libc.so
+        while (n && (path[n - 1] == '\n' || path[n - 1] == '\r')) path[--n] = 0;
+        // match suffix as path component end (libc.so, libGLESv2.so, ...)
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (strcmp(base, lib_suffix) != 0 && !strstr(base, lib_suffix)) {
+            // also allow path containing /libGLESv2.so
+            if (!strstr(path, lib_suffix)) continue;
+        }
         unsigned maj = 0, min = 0;
-        unsigned long inode = 0;
-        // scan from start skipping first 4 fields roughly
+        unsigned long inode = 0, offset = 0;
         char perms[8] = {};
-        unsigned long offset = 0;
         if (sscanf(line, "%*s %7s %lx %x:%x %lu", perms, &offset, &maj, &min, &inode) >= 5) {
+            if (inode == 0) continue;
             *dev = makedev(maj, min);
             *ino = (ino_t)inode;
             ok = true;
@@ -262,6 +261,7 @@ static bool maps_dev_ino(const char *lib_suffix, dev_t *dev, ino_t *ino) {
 }
 
 static void register_plt(Api *api, const char *lib, const char *sym, void *hook, void **orig) {
+    if (!api) return;
     dev_t dev = 0;
     ino_t ino = 0;
     if (!maps_dev_ino(lib, &dev, &ino)) {
@@ -269,6 +269,56 @@ static void register_plt(Api *api, const char *lib, const char *sym, void *hook,
         return;
     }
     api->pltHookRegister(dev, ino, sym, hook, orig);
+    LOGI("plt %s!%s dev=%lu ino=%lu", lib, sym, (unsigned long)dev, (unsigned long)ino);
+}
+
+/* Register glGetString on every mapped ELF that might call it (game + GLES) */
+static void register_gl_on_all(Api *api) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[768];
+    std::unordered_map<unsigned long, dev_t> seen; // inode → dev
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, " r-xp ")) continue;
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        if (strstr(path, "zygisk") || strstr(path, "magisk")) continue;
+        unsigned maj = 0, min = 0;
+        unsigned long inode = 0, offset = 0;
+        char perms[8] = {};
+        if (sscanf(line, "%*s %7s %lx %x:%x %lu", perms, &offset, &maj, &min, &inode) < 5)
+            continue;
+        if (inode == 0 || seen.count(inode)) continue;
+        seen[inode] = makedev(maj, min);
+    }
+    fclose(f);
+    for (auto &kv : seen) {
+        api->pltHookRegister(kv.second, (ino_t)kv.first, "glGetString",
+                             (void *)hook_glGetString, (void **)&orig_glGetString);
+        api->pltHookRegister(kv.second, (ino_t)kv.first, "eglQueryString",
+                             (void *)hook_glGetString, (void **)&orig_glGetString);
+    }
+    LOGI("gl plt registered on %zu elafs", seen.size());
+}
+
+static void try_early_gles() {
+    // Force map so pltHook can see them during preAppSpecialize
+    const char *libs[] = {
+        "libGLESv2.so", "libGLESv3.so", "libGLESv1_CM.so", "libEGL.so",
+        "/system/lib64/libGLESv2.so", "/system/lib/libGLESv2.so",
+        "/system/lib64/libEGL.so", "/system/lib/libEGL.so",
+        "/vendor/lib64/libGLESv2.so", "/vendor/lib/libGLESv2.so",
+        "/vendor/lib64/egl/libGLESv2_adreno.so",
+        "/vendor/lib64/egl/libGLESv2_mali.so",
+        "/vendor/lib/egl/libGLESv2_adreno.so",
+        "/vendor/lib/egl/libGLESv2_mali.so",
+        nullptr
+    };
+    for (int i = 0; libs[i]; i++) {
+        void *h = dlopen(libs[i], RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen(libs[i], RTLD_NOW);
+        if (h) LOGI("dlopen ok %s", libs[i]);
+    }
 }
 
 class StrongHide : public zygisk::ModuleBase {
@@ -276,11 +326,18 @@ public:
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        g_api = api;
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
         const char *nice = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!nice) return;
+
+        // denylist check — if on denylist, Zygisk will not stay injected
+        uint32_t flags = api->getFlags();
+        if (flags & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
+            LOGI("WARN %s is on DenyList — module will not hook this process. Remove it from DenyList.", nice);
+        }
 
         static bool loaded = false;
         if (!loaded) {
@@ -294,14 +351,26 @@ public:
             g_cfg = it->second;
             LOGI("target %s renderer=%s ram=%d", nice, g_cfg.renderer.c_str(), g_cfg.ram_gb);
 
-            register_plt(api, "libc.so",        "open",          (void *)hook_open,        (void **)&orig_open);
-            register_plt(api, "libc.so",        "openat",        (void *)hook_openat,      (void **)&orig_openat);
-            register_plt(api, "libc.so",        "read",          (void *)hook_read,        (void **)&orig_read);
-            register_plt(api, "libGLESv2.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-            register_plt(api, "libGLESv3.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-            register_plt(api, "libGLESv1_CM.so","glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-            register_plt(api, "libEGL.so",      "eglQueryString",(void *)hook_glGetString, (void **)&orig_glGetString);
-            api->pltHookCommit();
+            // path + meminfo + maps
+            register_plt(api, "libc.so", "open",   (void *)hook_open,   (void **)&orig_open);
+            register_plt(api, "libc.so", "openat", (void *)hook_openat, (void **)&orig_openat);
+            register_plt(api, "libc.so", "read",   (void *)hook_read,   (void **)&orig_read);
+
+            // pull GLES into the address space, then blanket-register glGetString
+            try_early_gles();
+            register_plt(api, "libGLESv2.so",    "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv3.so",    "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv1_CM.so", "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libEGL.so",       "eglQueryString", (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv2_adreno.so", "glGetString", (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv2_mali.so",   "glGetString", (void *)hook_glGetString, (void **)&orig_glGetString);
+            // also patch PLT of every already-mapped caller
+            register_gl_on_all(api);
+
+            bool ok = api->pltHookCommit();
+            LOGI("pltHookCommit=%d", (int)ok);
+        } else if (it != g_games.end()) {
+            LOGI("%s found but disabled", nice);
         }
 
         env->ReleaseStringUTFChars(args->nice_name, nice);
@@ -309,14 +378,8 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (!g_target) return;
-        // GLES/EGL often load after specialize — retry map lookup + hook
-        register_plt(api, "libGLESv2.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-        register_plt(api, "libGLESv3.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-        register_plt(api, "libGLESv1_CM.so","glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
-        register_plt(api, "libEGL.so",      "eglQueryString",(void *)hook_glGetString, (void **)&orig_glGetString);
-        api->pltHookCommit();
         if (g_cfg.props) spoof_props();
-        LOGI("applied");
+        LOGI("post applied props=%d paths=%d", (int)g_cfg.props, (int)g_cfg.paths);
     }
 
 private:
@@ -335,7 +398,6 @@ private:
         __system_property_set("ro.vendor.boot.warranty_bit", "0");
         __system_property_set("sys.oem_unlock_allowed", "0");
         __system_property_set("ro.boot.veritymode", "enforcing");
-        __system_property_set("ro.boot.verifiedbootstate", "green");
     }
 };
 
