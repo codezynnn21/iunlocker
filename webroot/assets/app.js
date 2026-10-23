@@ -218,50 +218,47 @@ function updateRamLabel() {
 }
 
 /* ---------- picker: installed packages ---------- */
+function shortName(pkg) {
+  const parts = pkg.split('.');
+  return parts[parts.length - 1] || pkg;
+}
+
 function renderPicker() {
   const box = $('pkgPicker');
-  const hint = $('pickerHint');
-  const q = filterText.toLowerCase().trim();
-
+  if (!box) return;
+  const q = (filterText || '').toLowerCase().trim();
   let list = installed.slice();
-  if (q) list = list.filter(p => p.toLowerCase().includes(q));
-
-  // also show already-configured packages that match filter even if not in scan
-  Object.keys(state.games).forEach(p => {
-    if (!list.includes(p) && (!q || p.toLowerCase().includes(q))) list.push(p);
+  Object.keys(state.games).forEach(p => { if (!list.includes(p)) list.push(p); });
+  if (q) {
+    list = list.filter(p => p.toLowerCase().includes(q) || shortName(p).toLowerCase().includes(q));
+  }
+  list.sort((a, b) => {
+    const ac = state.games[a] ? 0 : 1, bc = state.games[b] ? 0 : 1;
+    if (ac !== bc) return ac - bc;
+    return shortName(a).localeCompare(shortName(b));
   });
-  list.sort();
-
   box.innerHTML = '';
   if (!list.length) {
     const p = document.createElement('p');
-    p.className = 'hint';
-    p.id = 'pickerHint';
-    p.textContent = installed.length
-      ? 'No match — try another filter or type package below.'
-      : 'Tap Scan installed, or type a package name below.';
+    p.className = 'hint'; p.id = 'pickerHint';
+    p.textContent = installed.length ? 'No match — clear search.' : 'Tap Scan apps to load installed apps.';
     box.appendChild(p);
     return;
   }
-
-  // limit DOM size
-  const max = 80;
+  const max = 120;
   list.slice(0, max).forEach(pkg => {
-    const row = document.createElement('div');
     const isCfg = !!state.games[pkg];
     const isActive = pkg === state.active;
+    const row = document.createElement('div');
     row.className = 'pkg-item' + (isActive ? ' active' : '') + (isCfg ? ' configured' : '');
-    row.innerHTML = `
-      <div class="pkg-name">${pkg}</div>
-      <div class="pkg-badge">${isCfg ? (state.games[pkg].enabled !== false ? 'on' : 'off') : 'add'}</div>
-    `;
+    row.innerHTML = `<div class="pkg-text"><div class="pkg-title">${shortName(pkg)}</div><div class="pkg-name">${pkg}</div></div><div class="pkg-badge">${isCfg ? (state.games[pkg].enabled !== false ? 'on' : 'off') : 'select'}</div>`;
     row.onclick = () => pickPackage(pkg);
     box.appendChild(row);
   });
   if (list.length > max) {
     const more = document.createElement('p');
-    more.className = 'hint';
-    more.textContent = `…and ${list.length - max} more — refine filter`;
+    more.className = 'hint'; more.style.padding = '8px 12px';
+    more.textContent = `…${list.length - max} more — refine search`;
     box.appendChild(more);
   }
 }
@@ -359,7 +356,7 @@ async function persist() {
     const json = JSON.stringify(payload, null, 2);
     const escaped = json.replace(/'/g, "'\\''");
     await window.ksu.exec(
-      `mkdir -p /data/adb/iunlocker && printf '%s\\n' '${escaped}' > /data/adb/iunlocker/config.json`
+      `mkdir -p /data/adb/iunlocker && chmod 755 /data/adb/iunlocker && printf '%s\\n' '${escaped}' > /data/adb/iunlocker/config.json && chmod 644 /data/adb/iunlocker/config.json`
     );
   }
 }
@@ -395,32 +392,22 @@ async function load() {
 
 /* ---------- scan packages via ksu ---------- */
 async function scanPackages() {
-  setStatus('scanning…');
+  setStatus('scanning apps…');
   if (!window.ksu?.exec) {
-    setStatus('no ksu — type package manually');
-    toast('ksu not available');
+    setStatus('no root bridge — open from KernelSU/Magisk WebUI');
+    toast('need root WebUI');
     return;
   }
   try {
-    // third-party first, then all if empty
     let out = await window.ksu.exec('pm list packages -3 2>/dev/null');
-    let pkgs = (out || '')
-      .split('\n')
-      .map(l => l.replace(/^package:/, '').trim())
-      .filter(Boolean);
-
-    if (pkgs.length < 5) {
+    let pkgs = (out || '').split('\n').map(l => l.replace(/^package:/, '').trim()).filter(Boolean);
+    if (pkgs.length < 3) {
       out = await window.ksu.exec('pm list packages 2>/dev/null');
-      pkgs = (out || '')
-        .split('\n')
-        .map(l => l.replace(/^package:/, '').trim())
-        .filter(Boolean);
+      pkgs = (out || '').split('\n').map(l => l.replace(/^package:/, '').trim()).filter(Boolean);
     }
-
-    // prefer game-ish names near top of filter results (no hard filter — user searches)
     installed = [...new Set(pkgs)].sort();
-    setStatus(`found ${installed.length} packages`);
-    toast(`${installed.length} packages`);
+    setStatus('found ' + installed.length + ' apps');
+    toast(installed.length + ' apps');
     renderPicker();
   } catch (e) {
     setStatus('scan failed');
@@ -438,16 +425,6 @@ $('pkgFilter').oninput = (e) => {
 
 $('scanBtn').onclick = () => scanPackages();
 $('refreshBtn').onclick = () => { renderPicker(); renderGameList(); toast('refreshed'); };
-
-$('addGameBtn').onclick = () => {
-  const pkg = ($('newPkg').value || '').trim();
-  if (!pkg || !pkg.includes('.')) {
-    toast('valid package name needed');
-    return;
-  }
-  pickPackage(pkg);
-  $('newPkg').value = '';
-};
 
 $('saveBtn').onclick = async () => {
   if (!state.active) return;

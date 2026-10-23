@@ -241,3 +241,13 @@ select:focus { outline: none; border-color: var(--accent); background-color: #22
   max-height: 180px;
   object-position: center;
 }
+
+.pkg-text { flex: 1; min-width: 0; }
+.pkg-title {
+  font-weight: 600; font-size: .95rem; color: var(--text);
+  text-transform: none;
+}
+.pkg-name {
+  word-break: break-all; flex: none;
+  font-size: .72rem; color: var(--muted); margin-top: 2px;
+}
