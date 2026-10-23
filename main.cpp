@@ -1,14 +1,23 @@
 /*
- * iUnlocker GLTool — multi-game GPU/RAM spoof + path hide
+ * iUnlocker GLTool — aligned with reference architecture
  *
- * - libc open/openat/read: Zygisk pltHook in preAppSpecialize
- * - glGetString: own PLT/GOT patcher on a watcher thread (Zygisk API
- *   is dead after specialize; GLES/game libs load later)
+ * Reference (iUnlocker GLTool v1.1.5):
+ *  - Root companion loads package configs
+ *  - iUnlockerVMHook / inline on glGetString
+ *  - Full Vulkan: vkGetPhysicalDeviceProperties / Features / Memory / GetInstanceProcAddr
+ *
+ * This build:
+ *  - Companion reads /data/adb/iunlocker/config.json as root
+ *  - GLES: dlsym intercept + inline hook (correct GL_VENDOR/RENDERER enums)
+ *  - Vulkan: spoof deviceName in vkGetPhysicalDeviceProperties
+ *  - Path hide + meminfo RAM
+ *
+ * Game must NOT be on DenyList.
  */
 #include <sys/types.h>
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include "zygisk.hpp"
 #include <android/log.h>
@@ -17,18 +26,16 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <elf.h>
-#include <link.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
 #include <unordered_map>
-#include <unordered_set>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
+#include <vector>
 
 #define TAG "iunlocker"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -38,6 +45,25 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
 static const char *CONFIG = "/data/adb/iunlocker/config.json";
+
+enum {
+    GL_VENDOR                   = 0x1F00,
+    GL_RENDERER                 = 0x1F01,
+    GL_VERSION                  = 0x1F02,
+    GL_SHADING_LANGUAGE_VERSION = 0x8B8C,
+};
+
+/* Minimal Vulkan types (avoid vulkan headers) */
+struct VkPhysicalDeviceProperties {
+    uint32_t apiVersion;
+    uint32_t driverVersion;
+    uint32_t vendorID;
+    uint32_t deviceID;
+    uint32_t deviceType;
+    char     deviceName[256];
+    uint8_t  pipelineCacheUUID[16];
+    /* limits / sparse omitted — we only touch deviceName at fixed offset */
+};
 
 static const char *BLOCK_PATHS[] = {
     "/system/bin/su", "/system/xbin/su", "/sbin/su", "/vendor/bin/su",
@@ -60,9 +86,10 @@ struct GpuConfig {
 static std::unordered_map<std::string, GpuConfig> g_games;
 static GpuConfig g_cfg;
 static bool g_target = false;
-static volatile bool g_gl_hooked = false;
+static std::atomic<bool> g_gl_ok{false};
+static std::atomic<bool> g_vk_ok{false};
 
-/* -------------------- config -------------------- */
+/* -------------------- JSON -------------------- */
 
 static std::string extract_str(const std::string &json, const char *key) {
     auto p = json.find(key);
@@ -95,6 +122,10 @@ static GpuConfig parse_game_obj(const std::string &obj) {
     auto v = extract_str(obj, "\"vendor\"");   if (!v.empty()) c.vendor = v;
     auto ver = extract_str(obj, "\"version\""); if (!ver.empty()) c.version = ver;
     auto sh = extract_str(obj, "\"shading\""); if (!sh.empty()) c.shading = sh;
+    /* reference-style keys */
+    auto gm = extract_str(obj, "\"gl_model\"");   if (!gm.empty()) c.renderer = gm;
+    auto gv = extract_str(obj, "\"gl_vendor\"");  if (!gv.empty()) c.vendor = gv;
+    auto gver = extract_str(obj, "\"gl_version\""); if (!gver.empty()) c.version = gver;
     int ram = extract_int(obj, "\"ram\"", 8);
     if (ram >= 2 && ram <= 24) c.ram_gb = ram;
     c.props   = extract_bool(obj, "\"props\"", true);
@@ -102,13 +133,14 @@ static GpuConfig parse_game_obj(const std::string &obj) {
     c.enabled = extract_bool(obj, "\"enabled\"", true);
     return c;
 }
-static void load_config() {
+
+static void parse_config_json(const std::string &json) {
     g_games.clear();
-    std::ifstream f(CONFIG);
-    if (!f) { LOGI("no config"); return; }
-    std::string json((std::istreambuf_iterator<char>(f)), {});
     auto games_pos = json.find("\"games\"");
-    if (games_pos == std::string::npos) return;
+    if (games_pos == std::string::npos) {
+        LOGI("config has no games key");
+        return;
+    }
     size_t i = json.find('{', games_pos);
     if (i == std::string::npos) return;
     i++;
@@ -128,9 +160,18 @@ static void load_config() {
             oe++;
         }
         g_games[pkg] = parse_game_obj(json.substr(os, oe - os));
-        LOGI("cfg %s en=%d", pkg.c_str(), (int)g_games[pkg].enabled);
+        LOGI("cfg [%s] en=%d ren=%s", pkg.c_str(),
+             (int)g_games[pkg].enabled, g_games[pkg].renderer.c_str());
         i = oe;
     }
+    LOGI("loaded %zu packages", g_games.size());
+}
+
+static void load_config_from_disk() {
+    std::ifstream f(CONFIG);
+    if (!f) { LOGI("no config file"); return; }
+    std::string json((std::istreambuf_iterator<char>(f)), {});
+    parse_config_json(json);
 }
 
 static bool path_blocked(const char *p) {
@@ -140,7 +181,216 @@ static bool path_blocked(const char *p) {
     return false;
 }
 
-/* -------------------- libc hooks (zygisk) -------------------- */
+/* -------------------- GL hooks -------------------- */
+
+static const char *(*orig_glGetString)(unsigned) = nullptr;
+static void *(*orig_eglGetProcAddress)(const char *) = nullptr;
+static void *(*orig_dlsym)(void *, const char *) = nullptr;
+static void *(*orig_dlopen)(const char *, int) = nullptr;
+static void *(*orig_android_dlopen_ext)(const char *, int, const void *) = nullptr;
+
+static const char *hook_glGetString(unsigned name) {
+    switch (name) {
+        case GL_VENDOR:                   return g_cfg.vendor.c_str();
+        case GL_RENDERER:                 return g_cfg.renderer.c_str();
+        case GL_VERSION:                  return g_cfg.version.c_str();
+        case GL_SHADING_LANGUAGE_VERSION: return g_cfg.shading.c_str();
+        default: break;
+    }
+    return orig_glGetString ? orig_glGetString(name) : "";
+}
+
+static void *hook_eglGetProcAddress(const char *name) {
+    if (name && !strcmp(name, "glGetString"))
+        return (void *)hook_glGetString;
+    return orig_eglGetProcAddress ? orig_eglGetProcAddress(name) : nullptr;
+}
+
+/* -------------------- Vulkan hooks -------------------- */
+
+using PFN_vkVoid = void (*)(void);
+using PFN_vkGPDP = void (*)(void *dev, VkPhysicalDeviceProperties *props);
+using PFN_vkGIPA = void *(*)(void *instance, const char *name);
+
+static PFN_vkGPDP orig_vkGetPhysicalDeviceProperties = nullptr;
+static PFN_vkGIPA orig_vkGetInstanceProcAddr = nullptr;
+
+static void hook_vkGetPhysicalDeviceProperties(void *dev, VkPhysicalDeviceProperties *props) {
+    if (orig_vkGetPhysicalDeviceProperties)
+        orig_vkGetPhysicalDeviceProperties(dev, props);
+    if (props && g_target) {
+        memset(props->deviceName, 0, sizeof(props->deviceName));
+        strncpy(props->deviceName, g_cfg.renderer.c_str(), sizeof(props->deviceName) - 1);
+        LOGI("vk deviceName -> %s", props->deviceName);
+    }
+}
+
+static void *hook_vkGetInstanceProcAddr(void *instance, const char *name) {
+    if (name && !strcmp(name, "vkGetPhysicalDeviceProperties"))
+        return (void *)hook_vkGetPhysicalDeviceProperties;
+    return orig_vkGetInstanceProcAddr ? orig_vkGetInstanceProcAddr(instance, name) : nullptr;
+}
+
+static void *hook_dlsym(void *handle, const char *symbol) {
+    if (symbol) {
+        if (!strcmp(symbol, "glGetString")) {
+            if (!orig_glGetString && orig_dlsym)
+                orig_glGetString = (const char *(*)(unsigned))orig_dlsym(handle, symbol);
+            return (void *)hook_glGetString;
+        }
+        if (!strcmp(symbol, "eglGetProcAddress")) {
+            if (!orig_eglGetProcAddress && orig_dlsym)
+                orig_eglGetProcAddress = (void *(*)(const char *))orig_dlsym(handle, symbol);
+            return (void *)hook_eglGetProcAddress;
+        }
+        if (!strcmp(symbol, "vkGetPhysicalDeviceProperties")) {
+            if (!orig_vkGetPhysicalDeviceProperties && orig_dlsym)
+                orig_vkGetPhysicalDeviceProperties = (PFN_vkGPDP)orig_dlsym(handle, symbol);
+            return (void *)hook_vkGetPhysicalDeviceProperties;
+        }
+        if (!strcmp(symbol, "vkGetInstanceProcAddr")) {
+            if (!orig_vkGetInstanceProcAddr && orig_dlsym)
+                orig_vkGetInstanceProcAddr = (PFN_vkGIPA)orig_dlsym(handle, symbol);
+            return (void *)hook_vkGetInstanceProcAddr;
+        }
+    }
+    return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
+}
+
+/* -------------------- inline hook -------------------- */
+
+static bool mprotect_write(void *addr, size_t len) {
+    uintptr_t page = (uintptr_t)addr & ~((uintptr_t)0xFFF);
+    size_t span = ((uintptr_t)addr + len + 0xFFF) - page;
+    if (mprotect((void *)page, span, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) return true;
+    return mprotect((void *)page, span, PROT_READ | PROT_WRITE) == 0;
+}
+static void mprotect_exec(void *addr, size_t len) {
+    uintptr_t page = (uintptr_t)addr & ~((uintptr_t)0xFFF);
+    size_t span = ((uintptr_t)addr + len + 0xFFF) - page;
+    mprotect((void *)page, span, PROT_READ | PROT_EXEC);
+}
+
+#if defined(__aarch64__)
+static bool install_inline(void *sym, void *hook, void **orig_out) {
+    if (!sym || !hook) return false;
+    auto *p = (uint32_t *)sym;
+    if (p[0] == 0x58000050u && p[1] == 0xD61F0200u) return true;
+    static uint8_t pool[8][32];
+    static int pool_i = 0;
+    if (pool_i >= 8) return false;
+    uint8_t *tramp = pool[pool_i++];
+    if (!mprotect_write(tramp, 32)) return false;
+    memcpy(tramp, sym, 16);
+    auto *t = (uint32_t *)(tramp + 16);
+    t[0] = 0x58000050u;
+    t[1] = 0xD61F0200u;
+    *(uint64_t *)(t + 2) = (uint64_t)((uint8_t *)sym + 16);
+    mprotect_exec(tramp, 32);
+    if (orig_out && !*orig_out) *orig_out = tramp;
+    if (!mprotect_write(sym, 16)) return false;
+    p[0] = 0x58000050u;
+    p[1] = 0xD61F0200u;
+    *(uint64_t *)(p + 2) = (uint64_t)hook;
+    mprotect_exec(sym, 16);
+    __builtin___clear_cache((char *)sym, (char *)sym + 16);
+    return true;
+}
+#elif defined(__arm__)
+static bool install_inline(void *sym, void *hook, void **orig_out) {
+    if (!sym || !hook) return false;
+    auto *p = (uint32_t *)sym;
+    if (p[0] == 0xE51FF004u) return true;
+    static uint32_t pool[8][4];
+    static int pool_i = 0;
+    if (pool_i >= 8) return false;
+    uint32_t *tramp = pool[pool_i++];
+    if (!mprotect_write(tramp, 16)) return false;
+    tramp[0] = p[0]; tramp[1] = p[1];
+    tramp[2] = 0xE51FF004u;
+    tramp[3] = (uint32_t)((uint8_t *)sym + 8);
+    mprotect_exec(tramp, 16);
+    if (orig_out && !*orig_out) *orig_out = tramp;
+    if (!mprotect_write(sym, 8)) return false;
+    p[0] = 0xE51FF004u;
+    p[1] = (uint32_t)hook;
+    mprotect_exec(sym, 8);
+    __builtin___clear_cache((char *)sym, (char *)sym + 8);
+    return true;
+}
+#else
+static bool install_inline(void *, void *, void **) { return false; }
+#endif
+
+static void *real_dlsym(void *h, const char *s) {
+    return orig_dlsym ? orig_dlsym(h, s) : dlsym(h, s);
+}
+
+static bool try_hook_gl() {
+    const char *libs[] = {
+        "libGLESv2.so", "libGLESv3.so", "libEGL.so",
+        "/system/lib64/libGLESv2.so", "/system/lib/libGLESv2.so",
+        "/vendor/lib64/libGLESv2.so", "/vendor/lib/libGLESv2.so",
+        nullptr
+    };
+    bool any = false;
+    for (int i = 0; libs[i]; i++) {
+        void *h = dlopen(libs[i], RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen(libs[i], RTLD_NOW);
+        if (!h) continue;
+        void *gl = real_dlsym(h, "glGetString");
+        if (gl && gl != (void *)hook_glGetString) {
+            if (install_inline(gl, (void *)hook_glGetString, (void **)&orig_glGetString)) {
+                LOGI("GL inline glGetString @ %p (%s)", gl, libs[i]);
+                any = true;
+            } else LOGE("GL inline FAIL @ %p", gl);
+        }
+        void *egl = real_dlsym(h, "eglGetProcAddress");
+        if (egl && egl != (void *)hook_eglGetProcAddress) {
+            if (install_inline(egl, (void *)hook_eglGetProcAddress, (void **)&orig_eglGetProcAddress)) {
+                LOGI("GL inline eglGetProcAddress @ %p", egl);
+                any = true;
+            }
+        }
+    }
+    if (any) g_gl_ok = true;
+    return any;
+}
+
+static bool try_hook_vk() {
+    const char *libs[] = {
+        "libvulkan.so",
+        "/system/lib64/libvulkan.so", "/system/lib/libvulkan.so",
+        "/vendor/lib64/libvulkan.so", "/vendor/lib/libvulkan.so",
+        nullptr
+    };
+    bool any = false;
+    for (int i = 0; libs[i]; i++) {
+        void *h = dlopen(libs[i], RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen(libs[i], RTLD_NOW);
+        if (!h) continue;
+        void *gp = real_dlsym(h, "vkGetPhysicalDeviceProperties");
+        if (gp && gp != (void *)hook_vkGetPhysicalDeviceProperties) {
+            if (install_inline(gp, (void *)hook_vkGetPhysicalDeviceProperties,
+                               (void **)&orig_vkGetPhysicalDeviceProperties)) {
+                LOGI("VK inline Properties @ %p (%s)", gp, libs[i]);
+                any = true;
+            } else LOGE("VK inline FAIL @ %p", gp);
+        }
+        void *gipa = real_dlsym(h, "vkGetInstanceProcAddr");
+        if (gipa && gipa != (void *)hook_vkGetInstanceProcAddr) {
+            if (install_inline(gipa, (void *)hook_vkGetInstanceProcAddr,
+                               (void **)&orig_vkGetInstanceProcAddr)) {
+                LOGI("VK inline GetInstanceProcAddr @ %p", gipa);
+                any = true;
+            }
+        }
+    }
+    if (any) g_vk_ok = true;
+    return any;
+}
+
+/* -------------------- libc -------------------- */
 
 static int (*orig_openat)(int, const char *, int, ...) = nullptr;
 static int (*orig_open)(const char *, int, ...) = nullptr;
@@ -157,7 +407,7 @@ static int hook_open(const char *pathname, int flags, ...) {
 static ssize_t hook_read(int fd, void *buf, size_t count) {
     ssize_t n = orig_read ? orig_read(fd, buf, count) : -1;
     if (n <= 0) return n;
-    char path[64] = {}, real[128] = {};
+    char path[64] = {}, real[160] = {};
     snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
     ssize_t rl = readlink(path, real, sizeof(real) - 1);
     if (rl <= 0) return n;
@@ -168,7 +418,6 @@ static ssize_t hook_read(int fd, void *buf, size_t count) {
         while (std::getline(iss, line)) {
             if (line.find("zygisk") == std::string::npos &&
                 line.find("magisk") == std::string::npos &&
-                line.find("lsplt") == std::string::npos &&
                 line.find("iunlocker") == std::string::npos)
                 out += line + "\n";
         }
@@ -197,21 +446,24 @@ static ssize_t hook_read(int fd, void *buf, size_t count) {
     return n;
 }
 
-/* -------------------- GL spoof -------------------- */
-
-static const char *(*orig_glGetString)(unsigned) = nullptr;
-static const char *hook_glGetString(unsigned name) {
-    switch (name) {
-        case 0x1F01: return g_cfg.vendor.c_str();
-        case 0x1F00: return g_cfg.renderer.c_str();
-        case 0x1F02: return g_cfg.version.c_str();
-        case 0x8B8C: return g_cfg.shading.c_str();
-        default: break;
+static void *hook_dlopen(const char *f, int flags) {
+    void *h = orig_dlopen ? orig_dlopen(f, flags) : nullptr;
+    if (g_target && f) {
+        if (strstr(f, "GLES") || strstr(f, "EGL")) try_hook_gl();
+        if (strstr(f, "vulkan") || strstr(f, "Vulkan")) try_hook_vk();
     }
-    return orig_glGetString ? orig_glGetString(name) : "";
+    return h;
+}
+static void *hook_android_dlopen_ext(const char *f, int flags, const void *ext) {
+    void *h = orig_android_dlopen_ext ? orig_android_dlopen_ext(f, flags, ext) : nullptr;
+    if (g_target && f) {
+        if (strstr(f, "GLES") || strstr(f, "EGL")) try_hook_gl();
+        if (strstr(f, "vulkan") || strstr(f, "Vulkan")) try_hook_vk();
+    }
+    return h;
 }
 
-/* -------------------- maps / zygisk plt helpers -------------------- */
+/* -------------------- zygisk plt -------------------- */
 
 static bool maps_dev_ino(const char *lib_name, dev_t *dev, ino_t *ino) {
     FILE *f = fopen("/proc/self/maps", "r");
@@ -227,7 +479,7 @@ static bool maps_dev_ino(const char *lib_name, dev_t *dev, ino_t *ino) {
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         if (strcmp(base, lib_name) != 0 && !strstr(path, lib_name)) continue;
-        unsigned maj=0, min=0; unsigned long inode=0, off=0; char perms[8]={};
+        unsigned maj=0,min=0; unsigned long inode=0,off=0; char perms[8]={};
         if (sscanf(line, "%*s %7s %lx %x:%x %lu", perms, &off, &maj, &min, &inode) >= 5 && inode) {
             *dev = makedev(maj, min); *ino = (ino_t)inode; ok = true; break;
         }
@@ -237,330 +489,64 @@ static bool maps_dev_ino(const char *lib_name, dev_t *dev, ino_t *ino) {
 }
 
 static void register_plt(Api *api, const char *lib, const char *sym, void *hook, void **orig) {
-    if (!api) return;
     dev_t dev=0; ino_t ino=0;
     if (!maps_dev_ino(lib, &dev, &ino)) { LOGI("maps miss %s", lib); return; }
     api->pltHookRegister(dev, ino, sym, hook, orig);
-    LOGI("zygisk plt %s!%s", lib, sym);
+    LOGI("zygisk %s!%s", lib, sym);
 }
 
-/* -------------------- own PLT/GOT patcher (post-specialize) -------------------- */
-
-struct MapMod {
-    uintptr_t start, end;
-    std::string path;
-};
-
-static std::vector<MapMod> scan_maps() {
-    std::vector<MapMod> out;
+static void register_sym_all(Api *api, const char *sym, void *hook, void **orig) {
     FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return out;
+    if (!f) return;
     char line[768];
+    std::unordered_map<unsigned long, dev_t> seen;
     while (fgets(line, sizeof(line), f)) {
         if (!strstr(line, " r-xp ")) continue;
-        char *path = strchr(line, '/');
-        if (!path) continue;
-        size_t n = strlen(path);
-        while (n && (path[n-1]=='\n'||path[n-1]=='\r')) path[--n]=0;
-        uintptr_t start=0, end=0;
-        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
-        out.push_back({start, end, path});
+        if (strstr(line, "zygisk") || strstr(line, "magisk")) continue;
+        unsigned maj=0,min=0; unsigned long inode=0,off=0; char perms[8]={};
+        if (sscanf(line, "%*s %7s %lx %x:%x %lu", perms, &off, &maj, &min, &inode) < 5) continue;
+        if (!inode || seen.count(inode)) continue;
+        seen[inode] = makedev(maj, min);
     }
     fclose(f);
-    return out;
+    for (auto &kv : seen)
+        api->pltHookRegister(kv.second, (ino_t)kv.first, sym, hook, orig);
+    LOGI("zygisk %s x%zu", sym, seen.size());
 }
 
-static bool mprotect_rw(void *addr, size_t len) {
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xFFF;
-    size_t span = ((uintptr_t)addr + len + 0xFFF - page);
-    return mprotect((void *)page, span, PROT_READ | PROT_WRITE) == 0;
-}
-static bool mprotect_rx(void *addr, size_t len) {
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xFFF;
-    size_t span = ((uintptr_t)addr + len + 0xFFF - page);
-    return mprotect((void *)page, span, PROT_READ | PROT_EXEC) == 0;
-}
-
-#if defined(__aarch64__)
-using Elf_Ehdr = Elf64_Ehdr;
-using Elf_Phdr = Elf64_Phdr;
-using Elf_Dyn  = Elf64_Dyn;
-using Elf_Sym  = Elf64_Sym;
-using Elf_Rela = Elf64_Rela;
-using Elf_Rel  = Elf64_Rel;
-using Elf_Addr = Elf64_Addr;
-#define ELF_R_SYM ELF64_R_SYM
-#define ELF_R_TYPE ELF64_R_TYPE
-#elif defined(__arm__)
-using Elf_Ehdr = Elf32_Ehdr;
-using Elf_Phdr = Elf32_Phdr;
-using Elf_Dyn  = Elf32_Dyn;
-using Elf_Sym  = Elf32_Sym;
-using Elf_Rela = Elf32_Rela;
-using Elf_Rel  = Elf32_Rel;
-using Elf_Addr = Elf32_Addr;
-#define ELF_R_SYM ELF32_R_SYM
-#define ELF_R_TYPE ELF32_R_TYPE
-#else
-#error unsupported arch
-#endif
-
-/* Patch GOT entries for symbol in one loaded ELF (base = load bias) */
-static int patch_plt_symbol(uintptr_t base, const char *sym_name, void *hook, void **orig_out) {
-    auto *ehdr = (Elf_Ehdr *)base;
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return 0;
-
-    Elf_Phdr *phdr = (Elf_Phdr *)(base + ehdr->e_phoff);
-    Elf_Dyn *dyn = nullptr;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_DYNAMIC) {
-            dyn = (Elf_Dyn *)(base + phdr[i].p_vaddr);
-            break;
-        }
+static void *watcher(void *) {
+    for (int i = 0; i < 40; i++) {
+        usleep(250000);
+        try_hook_gl();
+        try_hook_vk();
+        if (g_gl_ok && g_vk_ok) break;
     }
-    if (!dyn) return 0;
-
-    Elf_Sym *symtab = nullptr;
-    const char *strtab = nullptr;
-    Elf_Rela *rela = nullptr; size_t relasz = 0;
-    Elf_Rel  *rel  = nullptr; size_t relsz  = 0;
-    Elf_Addr *jmprel = nullptr; size_t pltrelsz = 0; int pltrel = 0;
-
-    for (auto *d = dyn; d->d_tag != DT_NULL; d++) {
-        switch (d->d_tag) {
-            case DT_SYMTAB:   symtab = (Elf_Sym *)(base + d->d_un.d_ptr); break;
-            case DT_STRTAB:   strtab = (const char *)(base + d->d_un.d_ptr); break;
-            case DT_RELA:     rela = (Elf_Rela *)(base + d->d_un.d_ptr); break;
-            case DT_RELASZ:   relasz = d->d_un.d_val; break;
-            case DT_REL:      rel = (Elf_Rel *)(base + d->d_un.d_ptr); break;
-            case DT_RELSZ:    relsz = d->d_un.d_val; break;
-            case DT_JMPREL:   jmprel = (Elf_Addr *)(base + d->d_un.d_ptr); break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-            case DT_PLTREL:   pltrel = (int)d->d_un.d_val; break;
-            default: break;
-        }
-    }
-    if (!symtab || !strtab) return 0;
-
-    auto try_slot = [&](Elf_Addr *got) -> int {
-        if (!got) return 0;
-        if (!mprotect_rw(got, sizeof(void *))) return 0;
-        void *cur = (void *)(*got);
-        // skip if already our hook
-        if (cur == hook) return 0;
-        if (orig_out && !*orig_out && cur && cur != hook) *orig_out = cur;
-        *got = (Elf_Addr)hook;
-        mprotect_rx(got, sizeof(void *));
-        return 1;
-    };
-
-    int patched = 0;
-
-    // PLT relocations
-    if (jmprel && pltrelsz) {
-        if (pltrel == DT_RELA) {
-            auto *r = (Elf_Rela *)jmprel;
-            size_t n = pltrelsz / sizeof(Elf_Rela);
-            for (size_t i = 0; i < n; i++) {
-                size_t si = ELF_R_SYM(r[i].r_info);
-                if (strcmp(strtab + symtab[si].st_name, sym_name) == 0) {
-                    patched += try_slot((Elf_Addr *)(base + r[i].r_offset));
-                }
-            }
-        } else {
-            auto *r = (Elf_Rel *)jmprel;
-            size_t n = pltrelsz / sizeof(Elf_Rel);
-            for (size_t i = 0; i < n; i++) {
-                size_t si = ELF_R_SYM(r[i].r_info);
-                if (strcmp(strtab + symtab[si].st_name, sym_name) == 0) {
-                    patched += try_slot((Elf_Addr *)(base + r[i].r_offset));
-                }
-            }
-        }
-    }
-
-    // Also scan RELA/REL for absolute relocs to the symbol
-    if (rela && relasz) {
-        size_t n = relasz / sizeof(Elf_Rela);
-        for (size_t i = 0; i < n; i++) {
-            size_t si = ELF_R_SYM(rela[i].r_info);
-            if (strcmp(strtab + symtab[si].st_name, sym_name) == 0) {
-                patched += try_slot((Elf_Addr *)(base + rela[i].r_offset));
-            }
-        }
-    }
-    if (rel && relsz) {
-        size_t n = relsz / sizeof(Elf_Rel);
-        for (size_t i = 0; i < n; i++) {
-            size_t si = ELF_R_SYM(rel[i].r_info);
-            if (strcmp(strtab + symtab[si].st_name, sym_name) == 0) {
-                patched += try_slot((Elf_Addr *)(base + rel[i].r_offset));
-            }
-        }
-    }
-
-    return patched;
-}
-
-static bool should_patch_path(const std::string &path) {
-    // skip self / linker / zygisk
-    if (path.find("zygisk") != std::string::npos) return false;
-    if (path.find("magisk") != std::string::npos) return false;
-    if (path.find("iunlocker") != std::string::npos) return false;
-    if (path.find("/linker") != std::string::npos) return false;
-    // patch anything that might call glGetString
-    return true;
-}
-
-
-/* -------------------- inline hook on exported symbol -------------------- */
-
-#if defined(__aarch64__)
-static bool inline_hook(void *sym, void *hook, void **orig_out) {
-    if (!sym || !hook) return false;
-    auto *p = (uint32_t *)sym;
-    // already hooked?
-    if (p[0] == 0x58000050 && p[1] == 0xD61F0200) return true; // LDR X16,#8; BR X16
-    // trampoline: save first 16 bytes, jump to orig+16
-    static uint8_t tramp_pool[16 * 8];
-    static int tramp_i = 0;
-    if (tramp_i >= 8) return false;
-    uint8_t *tramp = tramp_pool + tramp_i * 16;
-    tramp_i++;
-    if (!mprotect_rw(tramp, 16)) return false;
-    memcpy(tramp, sym, 16);
-    // at end of tramp: LDR X16, #8; BR X16; .quad sym+16
-    auto *t32 = (uint32_t *)(tramp + 16);
-    // we only copied 16 bytes into 16-byte tramp — need a separate absolute jump back
-    // simpler: allocate 32-byte tramp
-    return false; // fall through to simpler path below
-}
-#endif
-
-static bool hook_export_gl() {
-    void *sym = dlsym(RTLD_DEFAULT, "glGetString");
-    if (!sym) {
-        // try loading first
-        dlopen("libGLESv2.so", RTLD_NOW);
-        sym = dlsym(RTLD_DEFAULT, "glGetString");
-    }
-    if (!sym) {
-        LOGI("dlsym glGetString miss");
-        return false;
-    }
-    if (sym == (void *)hook_glGetString) return true;
-
-#if defined(__aarch64__)
-    // 16-byte absolute branch stub at sym:
-    //   LDR X16, #8
-    //   BR  X16
-    //   .quad hook
-    auto *p = (uint32_t *)sym;
-    if (!mprotect_rw(sym, 16)) {
-        LOGE("mprotect glGetString failed");
-        return false;
-    }
-    // build a tiny trampoline that executes stolen bytes then jumps back
-    static uint32_t tramp[8];
-    static bool tramp_ready = false;
-    if (!tramp_ready) {
-        mprotect_rw(tramp, sizeof(tramp));
-        // copy first 4 instructions (16 bytes)
-        memcpy(tramp, p, 16);
-        // LDR X16, #8 ; BR X16 ; .quad (sym+16)
-        tramp[4] = 0x58000050;
-        tramp[5] = 0xD61F0200;
-        *(uint64_t *)(tramp + 6) = (uint64_t)((uint8_t *)sym + 16);
-        mprotect_rx(tramp, sizeof(tramp));
-        tramp_ready = true;
-        if (!orig_glGetString)
-            orig_glGetString = (const char *(*)(unsigned))(void *)tramp;
-    }
-    p[0] = 0x58000050; // LDR X16, #8
-    p[1] = 0xD61F0200; // BR X16
-    *(uint64_t *)(p + 2) = (uint64_t)hook_glGetString;
-    mprotect_rx(sym, 16);
-    LOGI("inline hooked glGetString @ %p", sym);
-    g_gl_hooked = true;
-    return true;
-#elif defined(__arm__)
-    // ARM 32: LDR PC, [PC, #-4]; .word hook
-    auto *p = (uint32_t *)sym;
-    if (!mprotect_rw(sym, 8)) return false;
-    static uint32_t tramp[4];
-    static bool tramp_ready = false;
-    if (!tramp_ready) {
-        mprotect_rw(tramp, sizeof(tramp));
-        tramp[0] = p[0];
-        tramp[1] = p[1];
-        tramp[2] = 0xE51FF004; // LDR PC, [PC, #-4]
-        tramp[3] = (uint32_t)((uint8_t *)sym + 8);
-        mprotect_rx(tramp, sizeof(tramp));
-        tramp_ready = true;
-        if (!orig_glGetString)
-            orig_glGetString = (const char *(*)(unsigned))(void *)tramp;
-    }
-    p[0] = 0xE51FF004;
-    p[1] = (uint32_t)hook_glGetString;
-    mprotect_rx(sym, 8);
-    LOGI("inline hooked glGetString @ %p", sym);
-    g_gl_hooked = true;
-    return true;
-#else
-    return false;
-#endif
-}
-
-
-static void patch_all_gl() {
-    auto mods = scan_maps();
-    int total = 0;
-    std::unordered_set<uintptr_t> done;
-    for (auto &m : mods) {
-        if (!should_patch_path(m.path)) continue;
-        if (done.count(m.start)) continue;
-        done.insert(m.start);
-        // ELF header must be readable at start of mapping — for some libs
-        // the first r-xp page is the text; ehdr is at file offset 0 which is
-        // often a separate r--p mapping. Find the lowest mapping for this path.
-        uintptr_t base = m.start;
-        for (auto &o : mods) {
-            if (o.path == m.path && o.start < base) base = o.start;
-        }
-        // verify ELF magic at base
-        if (base < 0x1000) continue;
-        auto *p = (const unsigned char *)base;
-        // may fault if not mapped readable — rely on r-xp which is readable
-        if (p[0] != 0x7f || p[1] != 'E' || p[2] != 'L' || p[3] != 'F') {
-            // try scanning for load bias via other means: skip
-            continue;
-        }
-        int n = patch_plt_symbol(base, "glGetString", (void *)hook_glGetString, (void **)&orig_glGetString);
-        n += patch_plt_symbol(base, "eglQueryString", (void *)hook_glGetString, (void **)&orig_glGetString);
-        if (n) {
-            LOGI("patched %d slots in %s", n, m.path.c_str());
-            total += n;
-        }
-    }
-    if (total > 0) {
-        g_gl_hooked = true;
-        LOGI("gl total patched slots=%d", total);
-    }
-}
-
-static void *gl_watcher(void *) {
-    for (int i = 0; i < 60; i++) {
-        usleep(500000);
-        if (hook_export_gl()) break;
-        patch_all_gl();
-        if (g_gl_hooked) break;
-    }
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 20; i++) {
         usleep(1000000);
-        hook_export_gl();
-        patch_all_gl();
+        try_hook_gl();
+        try_hook_vk();
     }
+    LOGI("watcher done gl=%d vk=%d", (int)g_gl_ok.load(), (int)g_vk_ok.load());
     return nullptr;
+}
+
+/* -------------------- companion (root config load) -------------------- */
+
+static void companion_handler(int fd) {
+    LOGI("Root companion started, reading config files");
+    std::ifstream f(CONFIG);
+    std::string json;
+    if (f) json.assign((std::istreambuf_iterator<char>(f)), {});
+    uint32_t n = (uint32_t)json.size();
+    if (write(fd, &n, sizeof(n)) != (ssize_t)sizeof(n)) {
+        LOGE("companion: send size fail");
+        return;
+    }
+    if (n && write(fd, json.data(), n) != (ssize_t)n) {
+        LOGE("companion: send data fail");
+        return;
+    }
+    LOGI("companion: sent %u bytes", n);
 }
 
 /* -------------------- module -------------------- */
@@ -576,26 +562,61 @@ public:
         const char *nice = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!nice) return;
 
-        uint32_t flags = api->getFlags();
-        if (flags & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
-            LOGE("DenyList ON for %s — remove game from DenyList or hooks never run", nice);
-        }
+        if (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST)
+            LOGE("DenyList ON for %s — REMOVE from DenyList", nice);
 
-        static bool cfg_once = false;
-        if (!cfg_once) { load_config(); cfg_once = true; }
+        /* prefer companion (root) config, fallback disk */
+        bool got = false;
+        int cfd = api->connectCompanion();
+        if (cfd >= 0) {
+            uint32_t n = 0;
+            if (read(cfd, &n, sizeof(n)) == (ssize_t)sizeof(n) && n > 0 && n < 2 * 1024 * 1024) {
+                std::string json(n, '\0');
+                size_t off = 0;
+                while (off < n) {
+                    ssize_t r = read(cfd, &json[off], n - off);
+                    if (r <= 0) break;
+                    off += (size_t)r;
+                }
+                if (off == n) {
+                    parse_config_json(json);
+                    got = true;
+                    LOGI("config from companion (%u bytes)", n);
+                }
+            }
+            close(cfd);
+        } else {
+            LOGI("companion unavailable, disk fallback");
+        }
+        if (!got) load_config_from_disk();
 
         auto it = g_games.find(nice);
-        if (it != g_games.end() && it->second.enabled) {
-            g_target = true;
-            g_cfg = it->second;
-            LOGI("target %s renderer=[%s] ram=%d", nice, g_cfg.renderer.c_str(), g_cfg.ram_gb);
-
-            register_plt(api, "libc.so", "open",   (void *)hook_open,   (void **)&orig_open);
-            register_plt(api, "libc.so", "openat", (void *)hook_openat, (void **)&orig_openat);
-            register_plt(api, "libc.so", "read",   (void *)hook_read,   (void **)&orig_read);
-            bool ok = api->pltHookCommit();
-            LOGI("libc pltHookCommit=%d", (int)ok);
+        if (it == g_games.end() || !it->second.enabled) {
+            LOGI("skip %s", nice);
+            env->ReleaseStringUTFChars(args->nice_name, nice);
+            return;
         }
+
+        g_target = true;
+        g_cfg = it->second;
+        LOGI("TARGET %s renderer=[%s] vendor=[%s] — Setting up GPU renderer spoofer hooks",
+             nice, g_cfg.renderer.c_str(), g_cfg.vendor.c_str());
+
+        register_plt(api, "libc.so", "open",   (void *)hook_open,   (void **)&orig_open);
+        register_plt(api, "libc.so", "openat", (void *)hook_openat, (void **)&orig_openat);
+        register_plt(api, "libc.so", "read",   (void *)hook_read,   (void **)&orig_read);
+
+        register_plt(api, "libdl.so", "dlsym", (void *)hook_dlsym, (void **)&orig_dlsym);
+        register_sym_all(api, "dlsym", (void *)hook_dlsym, (void **)&orig_dlsym);
+
+        register_plt(api, "libdl.so", "dlopen", (void *)hook_dlopen, (void **)&orig_dlopen);
+        register_plt(api, "libdl.so", "android_dlopen_ext",
+                     (void *)hook_android_dlopen_ext, (void **)&orig_android_dlopen_ext);
+        register_sym_all(api, "android_dlopen_ext",
+                         (void *)hook_android_dlopen_ext, (void **)&orig_android_dlopen_ext);
+
+        bool ok = api->pltHookCommit();
+        LOGI("pltHookCommit=%d", (int)ok);
 
         env->ReleaseStringUTFChars(args->nice_name, nice);
     }
@@ -611,14 +632,14 @@ public:
             __system_property_set("ro.boot.flash.locked", "1");
             __system_property_set("ro.boot.vbmeta.device_state", "locked");
             __system_property_set("ro.boot.warranty_bit", "0");
-            __system_property_set("ro.vendor.boot.warranty_bit", "0");
             __system_property_set("sys.oem_unlock_allowed", "0");
-            __system_property_set("ro.boot.veritymode", "enforcing");
         }
+        try_hook_gl();
+        try_hook_vk();
         pthread_t th;
-        pthread_create(&th, nullptr, gl_watcher, nullptr);
+        pthread_create(&th, nullptr, watcher, nullptr);
         pthread_detach(th);
-        LOGI("post: watcher started");
+        LOGI("post: hooks armed");
     }
 
 private:
@@ -627,3 +648,4 @@ private:
 };
 
 REGISTER_ZYGISK_MODULE(StrongHide)
+REGISTER_ZYGISK_COMPANION(companion_handler)
