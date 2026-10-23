@@ -5,6 +5,8 @@
  * Hooks: open/openat path denial, glGetString (multiple GLES/EGL libs),
  *        /proc/self/maps line filter, /proc/meminfo MemTotal rewrite
  */
+#include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <zygisk.hpp>
 #include <android/log.h>
 #include <sys/system_properties.h>
@@ -13,6 +15,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -225,6 +228,49 @@ static const char *hook_glGetString(unsigned name) {
     return orig_glGetString ? orig_glGetString(name) : "";
 }
 
+
+/* Resolve mapped library to (dev, inode) for modern Zygisk pltHookRegister */
+static bool maps_dev_ino(const char *lib_suffix, dev_t *dev, ino_t *ino) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    char line[512];
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        // ... pathname at end
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        // strip newline
+        size_t n = strlen(path);
+        while (n && (path[n-1] == '\n' || path[n-1] == '\r')) path[--n] = 0;
+        if (!strstr(path, lib_suffix)) continue;
+        // parse dev and inode: fields are addr perms offset dev inode path
+        // example: 7a2b000000-7a2b100000 r-xp 00000000 08:06 1234567 /system/lib64/libc.so
+        unsigned maj = 0, min = 0;
+        unsigned long inode = 0;
+        // scan from start skipping first 4 fields roughly
+        char perms[8] = {};
+        unsigned long offset = 0;
+        if (sscanf(line, "%*s %7s %lx %x:%x %lu", perms, &offset, &maj, &min, &inode) >= 5) {
+            *dev = makedev(maj, min);
+            *ino = (ino_t)inode;
+            ok = true;
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+static void register_plt(Api *api, const char *lib, const char *sym, void *hook, void **orig) {
+    dev_t dev = 0;
+    ino_t ino = 0;
+    if (!maps_dev_ino(lib, &dev, &ino)) {
+        LOGI("maps miss %s", lib);
+        return;
+    }
+    api->pltHookRegister(dev, ino, sym, hook, orig);
+}
+
 class StrongHide : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
@@ -248,14 +294,13 @@ public:
             g_cfg = it->second;
             LOGI("target %s renderer=%s ram=%d", nice, g_cfg.renderer.c_str(), g_cfg.ram_gb);
 
-            api->pltHookRegister(".*\\libc.so", "open",   (void *)hook_open,   (void **)&orig_open);
-            api->pltHookRegister(".*\\libc.so", "openat", (void *)hook_openat, (void **)&orig_openat);
-            api->pltHookRegister(".*\\libc.so", "read",   (void *)hook_read,   (void **)&orig_read);
-
-            api->pltHookRegister(".*\\libGLESv2.so",    "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
-            api->pltHookRegister(".*\\libGLESv3.so",    "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
-            api->pltHookRegister(".*\\libGLESv1_CM.so", "glGetString",    (void *)hook_glGetString, (void **)&orig_glGetString);
-            api->pltHookRegister(".*\\libEGL.so",       "eglQueryString", (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libc.so",        "open",          (void *)hook_open,        (void **)&orig_open);
+            register_plt(api, "libc.so",        "openat",        (void *)hook_openat,      (void **)&orig_openat);
+            register_plt(api, "libc.so",        "read",          (void *)hook_read,        (void **)&orig_read);
+            register_plt(api, "libGLESv2.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv3.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libGLESv1_CM.so","glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+            register_plt(api, "libEGL.so",      "eglQueryString",(void *)hook_glGetString, (void **)&orig_glGetString);
             api->pltHookCommit();
         }
 
@@ -264,6 +309,12 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (!g_target) return;
+        // GLES/EGL often load after specialize — retry map lookup + hook
+        register_plt(api, "libGLESv2.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+        register_plt(api, "libGLESv3.so",   "glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+        register_plt(api, "libGLESv1_CM.so","glGetString",   (void *)hook_glGetString, (void **)&orig_glGetString);
+        register_plt(api, "libEGL.so",      "eglQueryString",(void *)hook_glGetString, (void **)&orig_glGetString);
+        api->pltHookCommit();
         if (g_cfg.props) spoof_props();
         LOGI("applied");
     }
